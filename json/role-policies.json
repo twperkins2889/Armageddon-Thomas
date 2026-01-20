@@ -1,0 +1,30 @@
+{
+    "PolicyVersion": {
+        "Document": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ReadOnlyListActions",
+                    "Effect": "Allow",
+                    "Action": [
+                        "ec2:DescribeInstances",
+                        "ec2:DescribeSecurityGroups",
+                        "rds:DescribeDBInstances"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Sid": "ReadSpecificSecret",
+                    "Effect": "Allow",
+                    "Action": [
+                        "secretsmanager:GetSecretValue"
+                    ],
+                    "Resource": "arn:aws:secretsmanager:us-east-1:958699786524:secret:lab/rds/mysql"
+                }
+            ]
+        },
+        "VersionId": "v1",
+        "IsDefaultVersion": false,
+        "CreateDate": "2026-01-18T22:58:25+00:00"
+    }
+}
