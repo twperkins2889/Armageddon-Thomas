@@ -1,0 +1,325 @@
+STEP 1 Make sure EC2 is working
+
+curl http://http://44.200.59.244//list
+
+Step 2 Create your Parameters
+
+AWS Systems Manager > Parameter Store
+
+/lab/db/endpoint = lab-mysql.cmdeo2gyqgog.us-east-1.rds.amazonaws.com
+
+/lab/db/name = labmysql
+
+/lab/lb/port = 3306
+
+
+
+
+STEP 3  SNS SETUP
+
+aws sns create-topic --name lab-db-incidents
+
+
+aws sns subscribe \
+  --topic-arn arn:aws:sns:us-east-1:958699786524:lab-db-incidents \
+  --protocol email \
+  --notification-endpoint twperkins2889@gmail.com
+
+aws sns subscribe \
+   --topic-arn arn:aws:sns:us-east-1:958699786524:lab-db-incidents \
+   --protocol sms \
+   --notification-endpoint +1
+
+
+Make sure you get a email confirmation.
+
+"arn:aws:sns:us-east-1:958699786524:lab-db-incidents:9db6ae47-82af-4537-baf3-dad22425a594"
+
+aws cloudwatch put-metric-alarm \
+          --alarm-name lab-db-connection-failure \
+          --metric-name DBConnectionErrors \
+          --namespace Lab/RDSApp \
+          --statistic Sum \
+          --period 300 \
+          --threshold 3 \
+          --comparison-operator GreaterThanOrEqualToThreshold \
+          --evaluation-periods 1 \
+          --alarm-actions arn:aws:sns:us-east-1:958699786524:lab-db-incidents
+          --treat-missing-data notBreaching
+
+
+STEP 2  CREATE SECURITY GROUPS
+
+Create security group
+SG name = Ec2-sg-app  (sg for instance)  (sg-07e4211f04f9e790e | Ec2-sg-app)
+Attach to Lab-Vpc
+Inbound rules =  SSH/22/0.0.0.0/0 & HTTP/80/0.0.0.0/0
+Outbound rules = DO NOT TOUCH!!!
+Create security group
+
+Create security group
+SG name = rds-sg  (sg for rds database) (sg-023a3317c03efe4d5 | rds-sg)
+Attach to Lab-Vpc
+Inbound rules =  MySQL/Aurora - 3306 - ec2-sg-app
+Outbound rules = DO NOT TOUCH!!!
+Create security group
+
+
+STEP 5  CREATE RDS MYSQL
+
+Database creation method = Full Configuration
+Engine = MYSQL
+Version = Whatever the default is
+Templates = Free tier
+Availability and durability = Single-AZ DB instance deployment (1 instance)
+DB instance identifier = lab-MySQL
+Master Username = admin & Master password = Builttolast!!
+Virtual private cloud (VPC) = Lab-vpc
+Public access = No
+VPC security group:
+Remove default & add rds-sg (sg-023a3317c03efe4d5)
+Make sure to check all log export boxes
+Create datbase
+
+
+Step 6 Update Role & Attach Policy
+
+Iam > Roles > ec2-lab-read-secret-role
+
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ReadSpecificSecret",
+            "Effect": "Allow",
+            "Action": [
+                "secretsmanager:GetSecretValue"
+            ],
+            "Resource": "arn:aws:secretsmanager:us-east-1:958699786524:secret:lab/rds/mysql*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ssm:GetParameter",
+                "ssm:GetParameters"
+            ],
+            "Resource": "arn:aws:ssm:us-east-1:958699786524:parameter/lab/db/*"
+        }
+    ]
+}
+
+
+Then add permission & search for "CloudWatchAgentServerPolicy" & attach it to the role
+
+Step 7 Launch EC2
+
+Name = lab-ec2-app (i-09f9a4730c27ffaa4)
+AMI = Amazon Linux 2023
+Create new key pair = lab-ec2-app
+Attach to Lab-vpc
+Subnet = Public1-us-east-1a
+Auto-assign public IP = Enable
+Attach existing security group = Ec2-sg-app (sg-07e4211f04f9e790e)
+Attach to IAM role = ec2-lab-read-secret-role
+
+User data =
+
+#!/bin/bash
+# 1. Install System Dependencies
+dnf update -y
+dnf install -y python3-pip mariadb105
+pip3 install flask pymysql boto3 watchtower
+
+# 2. Create Directory
+mkdir -p /opt/rdsapp
+
+# 3. Create the Python Script (The Simple Version)
+cat >/opt/rdsapp/app.py <<'PY'
+import json
+import os
+import boto3
+import pymysql
+import logging
+from flask import Flask, request
+from watchtower import CloudWatchLogHandler
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+LOG_GROUP = "/aws/ec2/lab-rds-app"
+METRIC_NAMESPACE = "Lab/RDSApp"
+
+ssm = boto3.client("ssm", region_name=REGION)
+sm = boto3.client("secretsmanager", region_name=REGION)
+cw = boto3.client("cloudwatch", region_name=REGION)
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+try:
+    cw_handler = CloudWatchLogHandler(
+        log_group=LOG_GROUP,
+        stream_name="app-stream",
+        boto3_client=boto3.client("logs", region_name=REGION)
+    )
+    logger.addHandler(cw_handler)
+except Exception as e:
+    print(f"CloudWatch Logs Setup Pending: {e}")
+
+app = Flask(__name__)
+
+def record_failure(error_msg):
+    logger.error(f"DB_CONNECTION_FAILURE: {error_msg}")
+    try:
+        cw.put_metric_data(
+            Namespace=METRIC_NAMESPACE,
+            MetricData=[{'MetricName': 'DBConnectionErrors', 'Value': 1.0, 'Unit': 'Count'}]
+        )
+    except Exception as e:
+        logger.warning(f"Failed to push metric: {e}")
+
+def get_config():
+    try:
+        p_resp = ssm.get_parameters(
+            Names=['/lab/db/endpoint', '/lab/db/port', '/lab/db/name'],
+            WithDecryption=False
+        )
+        p_map = {p['Name']: p['Value'] for p in p_resp['Parameters']}
+        s_resp = sm.get_secret_value(SecretId='lab/rds/mysql')
+        secret = json.loads(s_resp['SecretString'])
+        return {
+            'host': p_map.get('/lab/db/endpoint'),
+            'port': int(p_map.get('/lab/db/port', 3306)),
+            'dbname': p_map.get('/lab/db/name', 'labdb'),
+            'user': secret.get('username'),
+            'password': secret.get('password')
+        }
+    except Exception as e:
+        record_failure(str(e))
+        raise e
+
+def get_conn():
+    c = get_config()
+    return pymysql.connect(
+        host=c['host'], user=c['user'], password=c['password'],
+        port=c['port'], database=c['dbname'], autocommit=True
+    )
+
+@app.route("/")
+def home():
+    return """
+    <h1>Lab 1b: Simple RDS App</h1>
+    <ul>
+        <li><a href='/init'>1. Init DB</a></li>
+        <li><a href='/add?text=LabEntry'>2. Add Note (?text=...)</a></li>
+        <li><a href='/list'>3. List Notes</a></li>
+    </ul>
+    """
+
+@app.route("/add")
+def add_note():
+    note_text = request.args.get('text', 'Manual Entry')
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO notes (note) VALUES (%s)", (note_text,))
+        cur.close()
+        conn.close()
+        return f"Added: {note_text} | <a href='/list'>View List</a>"
+    except Exception as e:
+        record_failure(str(e))
+        return f"Add Failed: {e}", 500
+
+@app.route("/list")
+def list_notes():
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id, note FROM notes ORDER BY id DESC;")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return "<h3>Notes:</h3>" + "".join([f"<li>{r[1]}</li>" for r in rows]) + "<br><a href='/'>Back</a>"
+    except Exception as e:
+        record_failure(str(e))
+        return f"List Failed: {e}", 500
+
+@app.route("/init")
+def init_db():
+    try:
+        c = get_config()
+        conn = pymysql.connect(host=c['host'], user=c['user'], password=c['password'], port=c['port'])
+        cur = conn.cursor()
+        cur.execute(f"CREATE DATABASE IF NOT EXISTS {c['dbname']};")
+        cur.execute(f"USE {c['dbname']};")
+        cur.execute("CREATE TABLE IF NOT EXISTS notes (id INT AUTO_INCREMENT PRIMARY KEY, note VARCHAR(255));")
+        cur.close()
+        conn.close()
+        return "Init Success! <a href='/'>Back</a>"
+    except Exception as e:
+        record_failure(str(e))
+        return f"Init Failed: {e}", 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=80)
+PY
+
+# 4. Create the Service File
+cat >/etc/systemd/system/rdsapp.service <<'SERVICE'
+[Unit]
+Description=Lab 1b RDS App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/rdsapp
+ExecStartPre=/usr/bin/sleep 20
+ExecStart=/usr/bin/python3 /opt/rdsapp/app.py
+Restart=always
+RestartSec=10s
+Environment=AWS_REGION=us-east-1
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+# 5. Start the Engine
+systemctl daemon-reload
+systemctl enable rdsapp
+systemctl start rdsapp
+
+
+MSYS_NO_PATHCONV=1 aws logs filter-log-events \
+      --log-group-name /aws/ec2/lab-rds-app \
+      --filter-pattern "DB_CONNECTION_FAILURE"
+
+MSYS_NO_PATHCONV=1 aws ssm get-parameters \
+        --names /lab/db/endpoint /lab/db/port /lab/db/name \
+        --with-decryption
+ 
+ aws ec2 describe-security-groups \
+--group-ids sg-0f829e4583f9bf58b \
+--region us-east-1 \
+--output json
+
+aws ec2 describe-security-groups \
+--group-ids sg-0f829e4583f9bf58b \
+--region us-east-1 \
+--query "SecurityGroups[].IpPermissions"
+
+aws rds describe-db-instances \
+--db-instance-identifier lab-MySQL \
+--region us-east-1 \
+--query "DBInstances[].PubliclyAccessible" \
+--output text
+
+aws rds describe-db-instances \
+--db-instance-identifier lab-MySQL \
+--region us-east-1 \
+--output text
+
+ curl http://13.223.205.136/list
+
+MSYS_NO_PATHCONV=1 aws ssm get-parameters --names /lab-mysql/endpoint /lab-mysql/name /lab-mysql/port --with-decryption --output table
+
+sudo systemctl restart rdsapp.service
+sudo systemctl status rdsapp.service --no-pager
+
+curl http://98.81.68.34/list
