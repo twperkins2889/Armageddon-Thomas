@@ -1,0 +1,11 @@
+A) Why is DB inbound source restricted to the EC2 security group?
+
+So only the EC2 server running the app can talk to the database. Nothing else is allowed in.
+
+B) What port does MySQL use?
+
+MySQL uses port 3306
+
+C) Why is Secrets Manager better than storing creds in code/user-data?
+
+Because passwords aren’t sitting in the code or on the server where they can be leaked. The server just asks AWS for them when it needs them.
