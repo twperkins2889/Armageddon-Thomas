@@ -1,0 +1,19 @@
+Incident Summary
+
+The application became unavailable due to a database connectivity failure after the RDS instance was stopped.
+
+What Failed?
+
+The Amazon RDS MySQL database was stopped, which prevented the application from connecting to the database.
+
+How It Was Detected?
+
+A CloudWatch alarm triggered for database connection errors, and the /list endpoint failed when accessed.
+
+Root Cause
+
+The database was unavailable because the RDS instance was turned off.
+
+Time to Recovery
+A few minutes.
+
